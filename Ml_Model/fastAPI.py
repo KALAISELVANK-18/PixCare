@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 import uvicorn
 import io
@@ -7,82 +7,66 @@ from PIL import Image, ImageOps
 import numpy as np
 import cv2
 
-
 app = FastAPI()
 
+def preprocess_image(image_path, size):
+    image = Image.open(image_path).convert("RGB")
+    image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
+    image_array = np.asarray(image).astype(np.float32)
+    normalized_image = (image_array / 127.5) - 1
+    return normalized_image
+
+def generate_thermal_image(image_path):
+    image = cv2.imread(image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    thermal = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+    cv2.imwrite('thermal.jpg', thermal)
+    return thermal.tolist()
 
 @app.post("/upload")
-async def upload(image: UploadFile = File(...)):
-
-    # Read the image file as bytes
+async def upload(image: UploadFile = File(...), red_difference: float = Form(...)):
     contents = await image.read()
+    with open("solution.jpg", "wb") as f:
+        f.write(contents)
 
-    # Convert bytes to a PIL Image
-    pil_image = Image.open(io.BytesIO(contents))
+    thermal_data = generate_thermal_image("solution.jpg")
 
-    # Convert PIL Image to a NumPy array
-    image_array = np.array(pil_image)
-
-    # Save the NumPy array as an image file
-    cv2.imwrite("solution.jpg", cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR))
-    testmodel=load_model("newmodel.h5", compile=False)
-    testlabel=open("testlabel.txt", "r").readlines()
-    model = load_model("main3_model.h5", compile=False)
-
-    # Load the labels
-    class_names = open("cancerlabel.txt", "r").readlines()
-
+    test_model = load_model("categorization_model.h5", compile=False)
     data = np.ndarray(shape=(1, 224, 224, 3), dtype=np.float32)
-
-    # Replace this with the path to your image
-    image = Image.open("solution.jpg").convert("RGB")
-    image_thermal = cv2.imread('solution.jpg')
-    # resizing the image to be at least 224x224 and then cropping from the center
-    cv2.resize(image_thermal,(224,224))
-    size = (224, 224)
-    gray_image = cv2.cvtColor(image_thermal, cv2.COLOR_BGR2GRAY)
-
-    # Apply a color mapping to simulate thermal imaging
-    # Here, we map darker pixels (cooler areas) to blue and brighter pixels (warmer areas) to red
-    thermal_image = cv2.applyColorMap(gray_image, cv2.COLORMAP_JET)
-    cv2.imwrite('thermal.jpg',thermal_image)
-    image_u8int_list = thermal_image.tolist()
-
-    image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
-
-    # turn the image into a numpy array
-    image_array = np.asarray(image)
-
-    # Normalize the image
-    normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
-
-    # Load the image into the array
-    data[0] = normalized_image_array
-
-    # Predicts the model
-    prediction = testmodel.predict(data)
+    data[0] = preprocess_image("solution.jpg", (224, 224))
+    prediction = test_model.predict(data)
     index = np.argmax(prediction)
-    class_name = testlabel[index]
     confidence_score = prediction[0][index]
-    print(class_name,confidence_score)
-    if((class_name!="1 normal" and confidence_score>=0.51)):
-        dprediction = model.predict(data)
-        dindex = np.argmax(dprediction)
-        print(dindex)
-        listofimg=list(zip(dprediction[0],class_names))
-        print(listofimg)
-        listofimg.sort(key=lambda x:x[0],reverse=True)
-        print(listofimg)
-        dclass_name_score = [[listofimg[0][1],str(listofimg[0][0])],[listofimg[1][1],str(listofimg[1][0])],[listofimg[2][1],str(listofimg[2][0])]]
-        dconfidence_score = dprediction[0][dindex]
 
-        class_name = class_names[dindex]
-        print(class_name,dconfidence_score)
-        return JSONResponse({'result':dclass_name_score,'diseases':True,"thermal":str(image_u8int_list)})
-    else:
-        return JSONResponse({'result':["No diseases found"],'diseases':False})
+    if index == 0:
+        return JSONResponse({'result': ["No diseases found"], 'diseases': False})
 
+    skin_model = load_model("diseases_verification_model.h5", compile=False)
+    prediction = skin_model.predict(data)
+    index = np.argmax(prediction)
+    confidence_score = prediction[0][index]
 
+    if index == 1 and confidence_score >= 0.4:
+        return JSONResponse({'result': ["No diseases found"], 'diseases': False})
+
+    model = load_model("disease_prediction_model.h5", compile=False)
+    label_file = "cancer_label.txt" if (red_difference * 0.0625) / 3 >= 0.7 else "dieases_label.txt"
+    class_names = open(label_file, "r").readlines()
+
+    data = np.ndarray(shape=(1, 299, 299, 3), dtype=np.float32)
+    data[0] = preprocess_image("solution.jpg", (299, 299))
+    dprediction = model.predict(data)
+    dindex = np.argmax(dprediction)
+
+    listofimg = [[pred, name] for pred, name in zip(dprediction[0], class_names)]
+    listofimg.sort(key=lambda x: x[0], reverse=True)
+
+    if label_file == "dieases_label.txt":
+        for i in range(3):
+            listofimg[i][0] *= 0.60
+
+    top3 = [[listofimg[i][1], str(listofimg[i][0])] for i in range(3)]
+    return JSONResponse({'result': top3, 'diseases': True, "thermal": str(thermal_data)})
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
